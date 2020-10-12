@@ -1365,15 +1365,35 @@ const nodeQuery = ({
   const predicate = predicateClauses ? `WHERE ${predicateClauses} ` : '';
   const { optimization, cypherPart: orderByClause } = orderByValue;
 
-  let query = `MATCH (${safeVariableName}:${safeLabelName}${
-    argString ? ` ${argString}` : ''
-  }) ${predicate}${
-    optimization.earlyOrderBy ? `WITH ${safeVariableName}${orderByClause}` : ''
-  }RETURN ${mapProjection} AS ${safeVariableName}${
-    optimization.earlyOrderBy ? '' : orderByClause
-  }${outerSkipLimit}`;
-
-  return [query, { ...params, ...fragmentTypeParams }];
+  if ('fulltextquery' in params) {
+    let querystring = params.fulltextquery;
+    let subQuery = subQuery.replace('.score', 'score');
+    let orderByClause = orderByClause.replace('work.score', 'score');
+    let query = `CALL db.index.fulltext.queryNodes('${variableName}', '${querystring}') yield node as ${safeVariableName}, score 
+      ${predicate}${
+      optimization.earlyOrderBy
+        ? `WITH ${safeVariableName}${orderByClause}`
+        : ''
+    }RETURN ${mapProjection} AS ${safeVariableName}${
+      optimization.earlyOrderBy ? '' : orderByClause
+    }${outerSkipLimit}`;
+    console.log(params);
+    console.log(query);
+    return [query, { ...params, ...fragmentTypeParams }];
+  } else {
+    let query = `MATCH (${safeVariableName}:${safeLabelName}${
+      argString ? ` ${argString}` : ''
+    }) ${predicate}${
+      optimization.earlyOrderBy
+        ? `WITH ${safeVariableName}${orderByClause}`
+        : ''
+    }RETURN ${mapProjection} AS ${safeVariableName}${
+      optimization.earlyOrderBy ? '' : orderByClause
+    }${outerSkipLimit}`;
+    console.log(params);
+    console.log(query);
+    return [query, { ...params, ...fragmentTypeParams }];
+  }
 };
 
 const buildMapProjection = ({

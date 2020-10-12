@@ -70,3 +70,5 @@ test/tck/*
 !test/tck/.gitkeep
 
 .history
+*.json
+package-lock.json
