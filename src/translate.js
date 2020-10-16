@@ -1365,10 +1365,10 @@ const nodeQuery = ({
   const predicate = predicateClauses ? `WHERE ${predicateClauses} ` : '';
   const { optimization, cypherPart: orderByClause } = orderByValue;
 
-  if ('fulltextquery' in params) {
-    let querystring = params.fulltextquery;
-    let subQuery = subQuery.replace('.score', 'score');
-    let orderByClause = orderByClause.replace('work.score', 'score');
+  if ('text' in params) {
+    let querystring = params.text;
+    // let subQuery = subQuery.replace('.score', 'score');
+    //let orderByClause = orderByClause.replace('work.score', 'score');
     let query = `CALL db.index.fulltext.queryNodes('${variableName}', '${querystring}') yield node as ${safeVariableName}, score 
       ${predicate}${
       optimization.earlyOrderBy
