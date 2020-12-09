@@ -5,8 +5,51 @@ import { ApolloServer } from 'apollo-server';
 import neo4j from 'neo4j-driver';
 
 const typeDefs = `
+
+type Query {
+  getStats(searchString: String): [Stats] @cypher(statement: """
+    CALL db.index.fulltext.queryNodes('lrmWork', $searchString) 
+yield node as work
+match (work)<-[c:CONTRIBUTOR_OF]-(p:lrmPerson)
+WITH 'work' as entity, c.role as key, p.name as value, count(*) as co
+order by key ascending, co descending
+return {entity: entity, key: key, value: value, count: co} as stat
+UNION ALL
+match (work)<-[r:REALIZES]-(e:lrmExpression)<-[c:CONTRIBUTOR_OF]-(p:lrmPerson)
+WITH 'expression' as entity, c.role as key, p.name as value, count(*) as co
+return {entity: entity, key: key, value: value, count: co} as stat
+UNION ALL
+match (work)<-[r:REALIZES]-(e:lrmExpression)
+WITH 'expression' as entity, 'language' as key, e.language as value, count(*) as co
+return {entity: entity, key: key, value: value, count: co} as stat
+UNION ALL
+match (work)<-[r:REALIZES]-(e:lrmExpression)
+WITH 'expression' as entity, 'type' as key, e.type as value, count(*) as co
+return {entity: entity, key: key, value: value, count: co} as stat
+UNION ALL
+MATCH (work)<-[r:REALIZES]-(e:lrmExpression)<-[x:EMBODIES]-(m:lrmManifestation)
+WITH 'manifestaion' as entity, 'media' as key, m.media as value, count(*) as co
+return {entity: entity, key: key, value: value, count: co} as stat
+UNION ALL
+MATCH (work)<-[r:REALIZES]-(e:lrmExpression)<-[x:EMBODIES]-(m:lrmManifestation)
+WITH 'manifestaion' as entity, 'carrier' as key, m.carrier as value, count(*) as co
+return {entity: entity, key: key, value: value, count: co} as stat
+
+  """)
+
+}
+
+
+
+type Stats{
+  entity: String
+  key: String
+  value: String
+  count: Int
+}
+
 type lrmPerson {
-  text: String
+  textquery: String
   uri: String
   label: String
   name: String
@@ -15,7 +58,7 @@ type lrmPerson {
 }
 
 type lrmWork{
-  text: String
+  textquery: String
   uri: String
   label: String
   title: String
@@ -28,7 +71,7 @@ type lrmWork{
 }
 
 type lrmExpression{
-  text: String
+  textquery: String
   uri: String
   label: String
   pagerank: String
@@ -42,7 +85,7 @@ type lrmExpression{
 }
 
 type lrmManifestation {
-  text: String
+  textquery: String
   uri: String
   label: String
   title: String
