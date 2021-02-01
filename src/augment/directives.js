@@ -1,5 +1,5 @@
-import { Kind, DirectiveLocation, GraphQLString } from 'graphql';
-import { TypeWrappers } from './fields';
+import { Kind, DirectiveLocation, GraphQLString, GraphQLFloat } from 'graphql';
+import { TypeWrappers, getFieldType } from './fields';
 import {
   buildDirectiveDefinition,
   buildInputValue,
@@ -27,11 +27,12 @@ export const DirectiveDefinition = {
   ADDITIONAL_LABELS: 'additionalLabels',
   ID: 'id',
   UNIQUE: 'unique',
-  INDEX: 'index'
+  INDEX: 'index',
+  SEARCH: 'search'
 };
 
 // The name of Role type used in authorization logic
-const ROLE_TYPE = 'Role';
+const ROLE_TYPE = process.env.AUTH_ROLE_ENUM_NAME || 'Role';
 
 /**
  * Enum for the names of directed fields on relationship types
@@ -169,41 +170,6 @@ export const augmentDirectiveDefinitions = ({
   });
   return [typeDefinitionMap, directiveDefinitionMap];
 };
-
-/**
- * Builds a relation directive for generated relationship output types
- */
-export const buildRelationDirective = ({
-  relationshipName,
-  fromType,
-  toType
-}) =>
-  buildDirective({
-    name: buildName({ name: DirectiveDefinition.RELATION }),
-    args: [
-      buildDirectiveArgument({
-        name: buildName({ name: 'name' }),
-        value: {
-          kind: Kind.STRING,
-          value: relationshipName
-        }
-      }),
-      buildDirectiveArgument({
-        name: buildName({ name: RelationshipDirectionField.FROM }),
-        value: {
-          kind: Kind.STRING,
-          value: fromType
-        }
-      }),
-      buildDirectiveArgument({
-        name: buildName({ name: RelationshipDirectionField.TO }),
-        value: {
-          kind: Kind.STRING,
-          value: toType
-        }
-      })
-    ]
-  });
 
 /**
  * Builds a MutationMeta directive for translating relationship mutations
@@ -350,7 +316,10 @@ const directiveDefinitionBuilderMap = {
           }
         }
       ],
-      locations: [DirectiveLocation.FIELD_DEFINITION]
+      locations: [
+        DirectiveLocation.FIELD_DEFINITION,
+        DirectiveLocation.INPUT_FIELD_DEFINITION
+      ]
     };
   },
   [DirectiveDefinition.RELATION]: ({ config }) => {
@@ -451,6 +420,20 @@ const directiveDefinitionBuilderMap = {
       name: DirectiveDefinition.INDEX,
       locations: [DirectiveLocation.FIELD_DEFINITION]
     };
+  },
+  [DirectiveDefinition.SEARCH]: ({ config }) => {
+    return {
+      name: DirectiveDefinition.SEARCH,
+      args: [
+        {
+          name: 'index',
+          type: {
+            name: GraphQLString
+          }
+        }
+      ],
+      locations: [DirectiveLocation.FIELD_DEFINITION]
+    };
   }
 };
 
@@ -511,12 +494,9 @@ export const getDirective = ({ directives, name }) => {
  */
 export const getDirectiveArgument = ({ directive, name }) => {
   let value = '';
-  const arg = directive.arguments.find(
-    arg => arg.name && arg.name.value === name
-  );
-  if (arg) {
-    value = arg.value.value;
-  }
+  const args = directive ? directive.arguments : [];
+  const arg = args.find(arg => arg.name && arg.name.value === name);
+  if (arg) value = arg.value.value;
   return value;
 };
 

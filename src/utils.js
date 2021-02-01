@@ -1,6 +1,10 @@
-import { parse, Kind } from 'graphql';
+import { parse, Kind, isInputObjectType } from 'graphql';
 import { unwrapNamedType, isListTypeField } from './augment/fields';
 import { Neo4jTypeFormatted } from './augment/types/types';
+import {
+  isRelationshipMutationOutputType,
+  isReflexiveRelationshipOutputType
+} from './augment/types/relationship/query';
 import { getFederatedOperationData } from './federation';
 import neo4j from 'neo4j-driver';
 import _ from 'lodash';
@@ -205,10 +209,6 @@ export function isArrayType(type) {
   return type ? type.toString().startsWith('[') : false;
 }
 
-export const isRelationTypeDirectedField = fieldName => {
-  return fieldName === 'from' || fieldName === 'to';
-};
-
 export const isNodeType = astNode => {
   return (
     astNode &&
@@ -235,9 +235,6 @@ export const isRelationTypePayload = schemaType => {
       })
     : undefined;
 };
-
-export const isRootSelection = ({ selectionInfo, rootType }) =>
-  selectionInfo && selectionInfo.rootType === rootType;
 
 export function lowFirstLetter(word) {
   return word.charAt(0).toLowerCase() + word.slice(1);
@@ -427,7 +424,8 @@ export const buildCypherParameters = ({
   args,
   statements = [],
   params,
-  paramKey
+  paramKey,
+  typeMap
 }) => {
   const dataParams = paramKey ? params[paramKey] : params;
   const paramKeys = dataParams ? Object.keys(dataParams) : [];
@@ -439,6 +437,7 @@ export const buildCypherParameters = ({
       if (fieldAst) {
         const unwrappedType = unwrapNamedType({ type: fieldAst.type });
         const fieldTypeName = unwrappedType.name;
+        const innerSchemaType = typeMap[fieldTypeName];
         if (isNeo4jTypeInput(fieldTypeName)) {
           paramStatements = buildNeo4jTypeCypherParameters({
             paramStatements,
@@ -448,7 +447,7 @@ export const buildCypherParameters = ({
             paramName,
             fieldTypeName
           });
-        } else {
+        } else if (!isInputObjectType(innerSchemaType)) {
           // normal case
           paramStatements.push(
             `${paramName}:$${paramKey ? `${paramKey}.` : ''}${paramName}`
@@ -473,7 +472,7 @@ const buildNeo4jTypeCypherParameters = ({
   const neo4jTypeConstructor = decideNeo4jTypeConstructor(fieldTypeName);
   if (neo4jTypeConstructor) {
     // Prefer only using formatted, if provided
-    if (formatted) {
+    if (formatted !== undefined) {
       if (paramKey) params[paramKey][paramName] = formatted;
       else params[paramName] = formatted;
       paramStatements.push(
@@ -651,30 +650,27 @@ export const safeLabel = l => {
 
 export const decideNestedVariableName = ({
   schemaTypeRelation,
+  schemaType,
   innerSchemaTypeRelation,
   variableName,
   fieldName,
   parentSelectionInfo
 }) => {
-  if (
-    isRootSelection({
-      selectionInfo: parentSelectionInfo,
-      rootType: 'relationship'
-    }) &&
-    isRelationTypeDirectedField(fieldName)
-  ) {
-    return parentSelectionInfo[fieldName];
+  let cypherVariable = variableName + '_' + fieldName;
+  if (isRelationshipMutationOutputType({ schemaType })) {
+    // used for relationship mutation output Payload types
+    cypherVariable = parentSelectionInfo[fieldName];
   } else if (schemaTypeRelation) {
     const fromTypeName = schemaTypeRelation.from;
     const toTypeName = schemaTypeRelation.to;
     if (fromTypeName === toTypeName) {
-      if (fieldName === 'from' || fieldName === 'to') {
-        return variableName + '_' + fieldName;
+      if (isReflexiveRelationshipOutputType({ schemaType })) {
+        cypherVariable = variableName + '_' + fieldName;
       } else {
         // Case of a reflexive relationship type's directed field
         // being renamed to its node type value
         // ex: from: User -> User: User
-        return variableName;
+        cypherVariable = variableName;
       }
     }
   } else {
@@ -683,14 +679,14 @@ export const decideNestedVariableName = ({
     if (innerSchemaTypeRelation) {
       // innerSchemaType is a field payload type using a @relation directive
       if (innerSchemaTypeRelation.from === innerSchemaTypeRelation.to) {
-        return variableName;
+        cypherVariable = variableName;
       }
     } else {
       // related types are different
-      return variableName + '_' + fieldName;
+      cypherVariable = variableName + '_' + fieldName;
     }
   }
-  return variableName + '_' + fieldName;
+  return cypherVariable;
 };
 
 export const initializeMutationParams = ({
@@ -960,12 +956,12 @@ export const removeIgnoredFields = (schemaType, selections) => {
 };
 
 export const getInterfaceDerivedTypeNames = (schema, interfaceName) => {
-  const implementingTypeMap = schema._implementations
-    ? schema._implementations[interfaceName]
+  const implementingTypeMap = schema._implementationsMap
+    ? schema._implementationsMap[interfaceName]
     : {};
   let implementingTypes = [];
-  if (implementingTypeMap) {
-    implementingTypes = Object.values(implementingTypeMap).map(
+  if (implementingTypeMap && implementingTypeMap.objects) {
+    implementingTypes = Object.values(implementingTypeMap.objects).map(
       type => type.name
     );
   }

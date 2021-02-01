@@ -1,3 +1,4 @@
+import { GraphQLID, GraphQLString } from 'graphql';
 import {
   augmentNodeQueryAPI,
   augmentNodeQueryArgumentTypes,
@@ -6,23 +7,22 @@ import {
 import { augmentNodeMutationAPI } from './mutation';
 import { augmentRelationshipTypeField } from '../relationship/relationship';
 import { augmentRelationshipMutationAPI } from '../relationship/mutation';
-import { shouldAugmentType } from '../../augment';
 import {
-  TypeWrappers,
   unwrapNamedType,
   isPropertyTypeField,
-  buildNeo4jSystemIDField,
-  getTypeFields
+  buildNeo4jSystemIDField
 } from '../../fields';
 import {
   FilteringArgument,
   OrderingArgument,
-  augmentInputTypePropertyFields
+  augmentInputTypePropertyFields,
+  SearchArgument
 } from '../../input-values';
 import {
   getRelationDirection,
   getRelationName,
   getDirective,
+  getDirectiveArgument,
   isIgnoredField,
   isCypherField,
   isPrimaryKeyField,
@@ -33,13 +33,6 @@ import {
   validateFieldDirectives
 } from '../../directives';
 import {
-  buildName,
-  buildNamedType,
-  buildInputObjectType,
-  buildInputValue
-} from '../../ast';
-import {
-  OperationType,
   isNodeType,
   isRelationshipType,
   isQueryTypeDefinition,
@@ -47,9 +40,7 @@ import {
   isObjectTypeExtensionDefinition,
   isInterfaceTypeExtensionDefinition
 } from '../../types/types';
-import { getPrimaryKey } from './selection';
 import { ApolloError } from 'apollo-server-errors';
-import { Kind } from 'graphql';
 
 /**
  * The main export for the augmentation process of a GraphQL
@@ -70,10 +61,13 @@ export const augmentNodeType = ({
   config
 }) => {
   let nodeInputTypeMap = {};
+  let searchInputTypeMap = {};
   let propertyOutputFields = [];
   let propertyInputValues = [];
   let extensionPropertyInputValues = [];
   let extensionNodeInputTypeMap = {};
+  // let extensionSearchInputTypeMap = {};
+  let searchesType = false;
   if (isObjectType || isInterfaceType || isUnionType) {
     const typeExtensions = typeExtensionDefinitionMap[typeName] || [];
     if (typeExtensions.length) {
@@ -90,17 +84,21 @@ export const augmentNodeType = ({
             extensionNodeInputTypeMap,
             propertyOutputFields,
             extensionPropertyInputValues,
-            isIgnoredType
+            isIgnoredType,
+            searchesType,
+            searchInputTypeMap
           ] = augmentNodeTypeFields({
             typeName,
             definition: extension,
             typeDefinitionMap,
             typeExtensionDefinitionMap,
             generatedTypeMap,
+            searchInputTypeMap,
             operationTypeMap,
             nodeInputTypeMap: extensionNodeInputTypeMap,
             propertyInputValues: extensionPropertyInputValues,
             propertyOutputFields,
+            searchesType,
             config
           });
           if (!isIgnoredType) {
@@ -117,17 +115,21 @@ export const augmentNodeType = ({
       nodeInputTypeMap,
       propertyOutputFields,
       propertyInputValues,
-      isIgnoredType
+      isIgnoredType,
+      searchesType,
+      searchInputTypeMap
     ] = augmentNodeTypeFields({
       typeName,
       definition,
       isUnionType,
       isQueryType,
+      searchesType,
       typeDefinitionMap,
       typeExtensionDefinitionMap,
       generatedTypeMap,
       operationTypeMap,
       nodeInputTypeMap,
+      searchInputTypeMap,
       extensionNodeInputTypeMap,
       propertyOutputFields,
       propertyInputValues,
@@ -160,10 +162,12 @@ export const augmentNodeType = ({
         isUnionType,
         isOperationType,
         isQueryType,
+        searchesType,
         typeName,
         propertyOutputFields,
         propertyInputValues,
         nodeInputTypeMap,
+        searchInputTypeMap,
         typeDefinitionMap,
         typeExtensionDefinitionMap,
         generatedTypeMap,
@@ -195,12 +199,14 @@ export const augmentNodeTypeFields = ({
   generatedTypeMap,
   operationTypeMap,
   nodeInputTypeMap = {},
+  searchInputTypeMap = {},
   extensionNodeInputTypeMap,
   propertyOutputFields = [],
   propertyInputValues = [],
   isUnionExtension,
   isObjectExtension,
   isInterfaceExtension,
+  searchesType,
   config
 }) => {
   let isIgnoredType = true;
@@ -265,6 +271,25 @@ export const augmentNodeTypeFields = ({
               type: unwrappedType,
               directives: fieldDirectives
             });
+            if (
+              outputType === GraphQLID.name ||
+              outputType === GraphQLString.name
+            ) {
+              const searchDirective = getDirective({
+                directives: fieldDirectives,
+                name: DirectiveDefinition.SEARCH
+              });
+              if (searchDirective) {
+                searchesType = true;
+                let indexName = getDirectiveArgument({
+                  directive: searchDirective,
+                  name: 'index'
+                });
+                // defult search index name for this node type
+                if (!indexName) indexName = `${typeName}Search`;
+                searchInputTypeMap[indexName] = true;
+              }
+            }
           }
         } else if (isNodeType({ definition: outputDefinition })) {
           [
@@ -353,7 +378,9 @@ export const augmentNodeTypeFields = ({
     nodeInputTypeMap,
     propertyOutputFields,
     propertyInputValues,
-    isIgnoredType
+    isIgnoredType,
+    searchesType,
+    searchInputTypeMap
   ];
 };
 
@@ -437,6 +464,7 @@ const augmentNodeTypeField = ({
         fromType,
         toType,
         relationshipName,
+        relationshipDirective,
         typeDefinitionMap,
         typeExtensionDefinitionMap,
         generatedTypeMap,
@@ -466,8 +494,10 @@ const augmentNodeTypeAPI = ({
   isUnionType,
   isOperationType,
   isQueryType,
+  searchesType,
   propertyInputValues,
   nodeInputTypeMap,
+  searchInputTypeMap,
   typeDefinitionMap,
   typeExtensionDefinitionMap,
   generatedTypeMap,
@@ -482,14 +512,7 @@ const augmentNodeTypeAPI = ({
       propertyInputValues,
       generatedTypeMap,
       operationTypeMap,
-      typeExtensionDefinitionMap,
-      config
-    });
-    generatedTypeMap = buildNodeSelectionInputType({
-      definition,
-      typeName,
-      propertyInputValues,
-      generatedTypeMap,
+      typeDefinitionMap,
       typeExtensionDefinitionMap,
       config
     });
@@ -501,8 +524,10 @@ const augmentNodeTypeAPI = ({
     isUnionType,
     isOperationType,
     isQueryType,
+    searchesType,
     propertyInputValues,
     nodeInputTypeMap,
+    searchInputTypeMap,
     typeDefinitionMap,
     typeExtensionDefinitionMap,
     generatedTypeMap,
@@ -510,54 +535,4 @@ const augmentNodeTypeAPI = ({
     config
   });
   return [typeDefinitionMap, generatedTypeMap, operationTypeMap];
-};
-
-/**
- * Builds the AST definition of the node input object type used
- * by relationship mutations for selecting the nodes of the
- * relationship
- */
-
-const buildNodeSelectionInputType = ({
-  definition,
-  typeName,
-  propertyInputValues,
-  generatedTypeMap,
-  typeExtensionDefinitionMap,
-  config
-}) => {
-  const mutationTypeName = OperationType.MUTATION;
-  const mutationTypeNameLower = mutationTypeName.toLowerCase();
-  if (shouldAugmentType(config, mutationTypeNameLower, typeName)) {
-    const fields = getTypeFields({
-      typeName,
-      definition,
-      typeExtensionDefinitionMap
-    });
-    const primaryKey = getPrimaryKey({ fields });
-    const propertyInputName = `_${typeName}Input`;
-    if (primaryKey) {
-      const primaryKeyName = primaryKey.name.value;
-      const primaryKeyInputConfig = propertyInputValues.find(
-        field => field.name === primaryKeyName
-      );
-      if (primaryKeyInputConfig) {
-        generatedTypeMap[propertyInputName] = buildInputObjectType({
-          name: buildName({ name: propertyInputName }),
-          fields: [
-            buildInputValue({
-              name: buildName({ name: primaryKeyName }),
-              type: buildNamedType({
-                name: primaryKeyInputConfig.type.name,
-                wrappers: {
-                  [TypeWrappers.NON_NULL_NAMED_TYPE]: true
-                }
-              })
-            })
-          ]
-        });
-      }
-    }
-  }
-  return generatedTypeMap;
 };

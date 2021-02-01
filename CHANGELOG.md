@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.19.1
+
+- Move `graphql-tools` to dependencies from devDependencies
+
+## 2.19.0
+
+- Update graphql.js to use v15
+
+## 2.18.0
+
+- [Custom nested mutations using `@cypher` on input fields](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/542)
+- [Support for fulltext search using `@search` directive](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/543)
+- [Add regular expression filter](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/543)
+- [Support for nested `@cypher` mutations](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/543)
+
+## 2.17.1
+
+- [Fix bug with mutations using `formatted` field for temporal types](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/531)
+- [Fix bug when ordering using `formatted` field for temporal types](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/531)
+- [Add new (optional) experimental mutation API](https://grandstack.io/docs/graphql-schema-generation-augmentation#experimental-api)
+
+## 2.17.0
+
+- [Allow user defined Role enum name](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/519)
+- [`@relation` type directive arguments for custom node type field names](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/521)
+- [Allow functional directives via schemaTransforms](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/530)
+
 ## 2.16.4
 
 - [Add documentation descriptions for generated schema](https://github.com/neo4j-graphql/neo4j-graphql-js/pull/515)

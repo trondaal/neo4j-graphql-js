@@ -5,30 +5,16 @@ import {
   safeVar,
   getFilterParams,
   lowFirstLetter,
-  isAddMutation,
-  isCreateMutation,
-  isUpdateMutation,
-  isRemoveMutation,
-  isMergeMutation,
-  isDeleteMutation,
   computeOrderBy,
   innerFilterParams,
   paramsToString,
   filterNullParams,
   getOuterSkipLimit,
   getQueryCypherDirective,
-  getMutationArguments,
-  setPrimaryKeyValue,
-  buildCypherParameters,
   getQueryArguments,
-  initializeMutationParams,
-  getMutationCypherDirective,
   isNodeType,
   getRelationTypeDirective,
-  isRelationTypeDirectedField,
   isRelationTypePayload,
-  isRootSelection,
-  splitSelectionParameters,
   getNeo4jTypeArguments,
   neo4jTypePredicateClauses,
   isNeo4jType,
@@ -46,10 +32,8 @@ import {
   getPayloadSelections,
   isGraphqlObjectType,
   decideNeo4jTypeConstructor
-} from './utils';
-import { getPrimaryKey } from './augment/types/node/selection';
+} from '../utils';
 import {
-  getNamedType,
   isScalarType,
   isEnumType,
   isObjectType,
@@ -61,25 +45,29 @@ import {
   getDerivedTypes,
   getUnionDerivedTypes,
   mergeSelectionFragments
-} from './selections';
+} from '../selections';
 import _ from 'lodash';
 import neo4j from 'neo4j-driver';
-import { isUnionTypeDefinition } from './augment/types/types';
 import {
   getFederatedOperationData,
   setCompoundKeyFilter,
   NEO4j_GRAPHQL_SERVICE
-} from './federation';
+} from '../federation';
 import {
   unwrapNamedType,
   isListTypeField,
   TypeWrappers
-} from './augment/fields';
+} from '../augment/fields';
 import {
-  analyzeMutationArguments,
   isNeo4jTypeArgument,
-  OrderingArgument
-} from './augment/input-values';
+  OrderingArgument,
+  SearchArgument
+} from '../augment/input-values';
+import {
+  isRelationshipMutationOutputType,
+  isReflexiveRelationshipOutputType
+} from '../augment/types/relationship/query';
+import { ApolloError } from 'apollo-server-errors';
 
 const derivedTypesParamName = schemaTypeName =>
   `${schemaTypeName}_derivedTypes`;
@@ -203,7 +191,6 @@ export const relationFieldOnNodeType = ({
   selectionFilters,
   neo4jTypeArgs,
   fieldsForTranslation,
-  schemaType,
   subSelection,
   skipLimit,
   commaIfTail,
@@ -226,7 +213,6 @@ export const relationFieldOnNodeType = ({
     derivedTypeMap,
     resolveInfo
   });
-
   const allParams = innerFilterParams(filterParams, neo4jTypeArgs);
   const queryParams = paramsToString(
     _.filter(allParams, param => {
@@ -268,6 +254,13 @@ export const relationFieldOnNodeType = ({
     resolveInfo
   });
 
+  const [lhsOrdering, rhsOrdering] = translateNestedOrderingArgument({
+    schemaType: innerSchemaType,
+    selections: fieldsForTranslation,
+    fieldSelectionSet,
+    filterParams
+  });
+
   let whereClauses = [
     labelPredicate,
     ...neo4jTypeClauses,
@@ -275,32 +268,9 @@ export const relationFieldOnNodeType = ({
     ...filterPredicates
   ].filter(predicate => !!predicate);
 
-  const orderByParam = filterParams['orderBy'];
-  const usesTemporalOrdering = temporalOrderingFieldExists(
-    schemaType,
-    filterParams
-  );
-
-  const selectedFieldNames = fieldSelectionSet.reduce((fieldNames, field) => {
-    if (field.name) fieldNames.push(field.name.value);
-    return fieldNames;
-  }, []);
-  const neo4jTypeFieldSelections = buildOrderedNeo4jTypeSelections({
-    schemaType: innerSchemaType,
-    selections: fieldsForTranslation,
-    usesTemporalOrdering,
-    selectedFieldNames
-  });
-
   tailParams.initial = `${initial}${fieldName}: ${
     !isArrayType(fieldType) ? 'head(' : ''
-  }${
-    orderByParam
-      ? usesTemporalOrdering
-        ? `[sortedElement IN apoc.coll.sortMulti(`
-        : `apoc.coll.sortMulti(`
-      : ''
-  }[(${safeVar(variableName)})${
+  }${lhsOrdering}[(${safeVar(variableName)})${
     isUnionTypeField
       ? `--`
       : `${
@@ -316,17 +286,9 @@ export const relationFieldOnNodeType = ({
     )
   ])}`}${queryParams})${
     whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : ''
-  } | ${mapProjection}]${
-    orderByParam
-      ? `, [${buildSortMultiArgs(orderByParam)}])${
-          usesTemporalOrdering
-            ? ` | sortedElement { .* ${
-                neo4jTypeFieldSelections ? `,  ${neo4jTypeFieldSelections}` : ''
-              }}]`
-            : ``
-        }`
-      : ''
-  }${!isArrayType(fieldType) ? ')' : ''}${skipLimit} ${commaIfTail}`;
+  } | ${mapProjection}]${rhsOrdering}${
+    !isArrayType(fieldType) ? ')' : ''
+  }${skipLimit} ${commaIfTail}`;
 
   return [tailParams, subSelection];
 };
@@ -359,7 +321,6 @@ export const relationTypeFieldOnNodeType = ({
     translation = `${initial}${fieldName}: {${subSelection[0]}}${skipLimit} ${commaIfTail}`;
   } else {
     const relationshipVariableName = `${nestedVariable}_relation`;
-
     const neo4jTypeClauses = neo4jTypePredicateClauses(
       filterParams,
       relationshipVariableName,
@@ -385,52 +346,6 @@ export const relationTypeFieldOnNodeType = ({
       subSelection[1][filterParamKey] = serializedFilterParam[filterParamKey];
     }
 
-    const orderByParam = filterParams['orderBy'];
-    const usesTemporalOrdering = temporalOrderingFieldExists(
-      innerSchemaType,
-      filterParams
-    );
-    const selectedFieldNames = fieldSelectionSet.reduce((fieldNames, field) => {
-      if (field.name) fieldNames.push(field.name.value);
-      return fieldNames;
-    }, []);
-    const neo4jTypeFieldSelections = buildOrderedNeo4jTypeSelections({
-      schemaType: innerSchemaType,
-      selections: fieldsForTranslation,
-      usesTemporalOrdering,
-      selectedFieldNames
-    });
-
-    const lhsOrdering = `${
-      orderByParam
-        ? usesTemporalOrdering
-          ? `[sortedElement IN apoc.coll.sortMulti(`
-          : `apoc.coll.sortMulti(`
-        : ''
-    }`;
-
-    const rhsOrdering = `${
-      orderByParam
-        ? `, [${buildSortMultiArgs(orderByParam)}])${
-            usesTemporalOrdering
-              ? ` | sortedElement { .* ${
-                  neo4jTypeFieldSelections
-                    ? `,  ${neo4jTypeFieldSelections}`
-                    : ''
-                }}]`
-              : ``
-          }`
-        : ''
-    }`;
-
-    const incomingNodeTypeName = innerSchemaTypeRelation.from;
-    const outgoingNodeTypeName = innerSchemaTypeRelation.to;
-    const innerSchemaTypeFields = innerSchemaType.getFields();
-    const outgoingSchemaType = resolveInfo.schema.getType(outgoingNodeTypeName);
-    const incomingSchemaType = resolveInfo.schema.getType(incomingNodeTypeName);
-    const selectsIncomingField = innerSchemaTypeFields[incomingNodeTypeName];
-    const selectsOutgoingField = innerSchemaTypeFields[outgoingNodeTypeName];
-
     const allParams = innerFilterParams(filterParams, neo4jTypeArgs);
     const queryParams = paramsToString(
       _.filter(allParams, param => {
@@ -448,41 +363,69 @@ export const relationTypeFieldOnNodeType = ({
       resolveInfo
     });
 
+    const [lhsOrdering, rhsOrdering] = translateNestedOrderingArgument({
+      schemaType: innerSchemaType,
+      selections: fieldsForTranslation,
+      fieldSelectionSet,
+      filterParams
+    });
+
+    const fromTypeName = innerSchemaTypeRelation.from;
+    const toTypeName = innerSchemaTypeRelation.to;
+    const schemaTypeName = schemaType.name;
+    const isFromField = schemaTypeName === fromTypeName;
+    const isToField = schemaTypeName === toTypeName;
+
+    const incomingNodeTypeName = innerSchemaTypeRelation.from;
+    const outgoingNodeTypeName = innerSchemaTypeRelation.to;
+    const innerSchemaTypeFields = innerSchemaType.getFields();
+    const selectsIncomingField = innerSchemaTypeFields[incomingNodeTypeName];
+    const selectsOutgoingField = innerSchemaTypeFields[outgoingNodeTypeName];
+    const nestedTypeLabels =
+      selectsOutgoingField || isFromField
+        ? [
+            toTypeName,
+            ...getAdditionalLabels(
+              resolveInfo.schema.getType(toTypeName),
+              cypherParams
+            )
+          ]
+        : [
+            fromTypeName,
+            ...getAdditionalLabels(
+              resolveInfo.schema.getType(fromTypeName),
+              cypherParams
+            )
+          ];
+
     const whereClauses = [
       ...neo4jTypeClauses,
       ...filterPredicates,
       ...arrayPredicates
     ];
-
     translation = `${initial}${fieldName}: ${
       !isArrayType(fieldType) ? 'head(' : ''
     }${lhsOrdering}[(${safeVar(variableName)})${
       // if its fromField -- is this logically equivalent?
-      selectsIncomingField ? '<' : ''
+      selectsIncomingField || isToField ? '<' : ''
     }-[${safeVar(relationshipVariableName)}:${safeLabel(
       innerSchemaTypeRelation.name
-    )}${queryParams}]-${selectsOutgoingField ? '>' : ''}(:${safeLabel(
-      selectsOutgoingField
-        ? [
-            outgoingNodeTypeName,
-            ...getAdditionalLabels(outgoingSchemaType, cypherParams)
-          ]
-        : [
-            incomingNodeTypeName,
-            ...getAdditionalLabels(incomingSchemaType, cypherParams)
-          ]
-    )}) ${
+    )}${queryParams}]-${
+      selectsOutgoingField || isFromField ? '>' : ''
+    }(:${safeLabel(nestedTypeLabels)}) ${
       whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')} ` : ''
     }| ${relationshipVariableName} {${subSelection[0]}}]${rhsOrdering}${
       !isArrayType(fieldType) ? ')' : ''
     }${skipLimit} ${commaIfTail}`;
   }
+
   tailParams.initial = translation;
   return [tailParams, subSelection];
 };
 
 export const nodeTypeFieldOnRelationType = ({
   initial,
+  schemaType,
   fieldName,
   fieldType,
   variableName,
@@ -510,16 +453,14 @@ export const nodeTypeFieldOnRelationType = ({
   fieldArgs,
   cypherParams
 }) => {
-  if (
-    isRootSelection({
-      selectionInfo: parentSelectionInfo,
-      rootType: 'relationship'
-    }) &&
-    isRelationTypeDirectedField(fieldName)
-  ) {
+  if (isRelationshipMutationOutputType({ schemaType })) {
+    const fromArgName = parentSelectionInfo.fromArgName;
+    const toArgName = parentSelectionInfo.toArgName;
     const nodeFieldVariableName = decideRootRelationshipTypeNodeVariable({
       parentSelectionInfo,
-      fieldName
+      fieldName,
+      fromArgName,
+      toArgName
     });
     const [mapProjection, labelPredicate] = buildMapProjection({
       schemaType: innerSchemaType,
@@ -539,14 +480,14 @@ export const nodeTypeFieldOnRelationType = ({
       mapProjection,
       skipLimit,
       commaIfTail,
-      tailParams,
-      parentSelectionInfo
+      tailParams
     });
     return [translationParams, subSelection];
   }
   // Normal case of schemaType with a relationship directive
   return directedNodeTypeFieldOnRelationType({
     initial,
+    schemaType,
     fieldName,
     fieldType,
     variableName,
@@ -571,20 +512,25 @@ export const nodeTypeFieldOnRelationType = ({
     schemaTypeFields,
     derivedTypeMap,
     fieldArgs,
-    cypherParams
+    cypherParams,
+    parentSelectionInfo
   });
 };
 
 const decideRootRelationshipTypeNodeVariable = ({
   parentSelectionInfo = {},
-  fieldName
+  fieldName = '',
+  fromArgName = '',
+  toArgName = ''
 }) => {
-  const fromVariable = parentSelectionInfo.from;
-  const toVariable = parentSelectionInfo.to;
+  const fromVariable =
+    parentSelectionInfo.from || parentSelectionInfo[fromArgName];
+  const toVariable = parentSelectionInfo.to || parentSelectionInfo[toArgName];
   // assume incoming
   let variableName = safeVar(fromVariable);
   // else set as outgoing
-  if (fieldName === 'to') variableName = safeVar(toVariable);
+  if (fieldName === 'to' || fieldName === toArgName)
+    variableName = safeVar(toVariable);
   return variableName;
 };
 
@@ -594,19 +540,18 @@ const relationTypeMutationPayloadField = ({
   mapProjection,
   skipLimit,
   commaIfTail,
-  tailParams,
-  parentSelectionInfo
+  tailParams
 }) => {
+  const translation = `${initial}${fieldName}: ${mapProjection}${skipLimit} ${commaIfTail}`;
   return {
-    initial: `${initial}${fieldName}: ${mapProjection}${skipLimit} ${commaIfTail}`,
-    ...tailParams,
-    variableName:
-      fieldName === 'from' ? parentSelectionInfo.to : parentSelectionInfo.from
+    initial: translation,
+    ...tailParams
   };
 };
 
 const directedNodeTypeFieldOnRelationType = ({
   initial,
+  schemaType,
   fieldName,
   fieldType,
   variableName,
@@ -631,13 +576,17 @@ const directedNodeTypeFieldOnRelationType = ({
   schemaTypeFields,
   derivedTypeMap,
   fieldArgs,
-  cypherParams
+  cypherParams,
+  parentSelectionInfo
 }) => {
   const relType = schemaTypeRelation.name;
   const fromTypeName = schemaTypeRelation.from;
   const toTypeName = schemaTypeRelation.to;
-  const isFromField = fieldName === fromTypeName || fieldName === 'from';
-  const isToField = fieldName === toTypeName || fieldName === 'to';
+  const parentSchemaTypeName = parentSelectionInfo.schemaType.name;
+  const innerSchemaTypeName = innerSchemaType.name;
+  let isFromField =
+    innerSchemaTypeName === fromTypeName || fieldName === 'from';
+  let isToField = innerSchemaTypeName === toTypeName || fieldName === 'to';
   const safeVariableName = nestedVariable;
   const [mapProjection, labelPredicate] = buildMapProjection({
     schemaType: innerSchemaType,
@@ -651,7 +600,6 @@ const directedNodeTypeFieldOnRelationType = ({
     derivedTypeMap,
     resolveInfo
   });
-
   const allParams = innerFilterParams(filterParams, neo4jTypeArgs);
   const queryParams = paramsToString(
     _.filter(allParams, param => {
@@ -660,55 +608,15 @@ const directedNodeTypeFieldOnRelationType = ({
       return !Array.isArray(value);
     })
   );
-
   // Since the translations are significantly different,
   // we first check whether the relationship is reflexive
   if (fromTypeName === toTypeName) {
     const relationshipVariableName = `${variableName}_${
       isFromField ? 'from' : 'to'
     }_relation`;
-    if (isRelationTypeDirectedField(fieldName)) {
-      const orderByParam = filterParams['orderBy'];
-      const usesTemporalOrdering = temporalOrderingFieldExists(
-        innerSchemaType,
-        filterParams
-      );
-      const selectedFieldNames = fieldSelectionSet.reduce(
-        (fieldNames, field) => {
-          if (field.name) fieldNames.push(field.name.value);
-          return fieldNames;
-        },
-        []
-      );
-      const neo4jTypeFieldSelections = buildOrderedNeo4jTypeSelections({
-        schemaType: innerSchemaType,
-        selections: fieldsForTranslation,
-        usesTemporalOrdering,
-        selectedFieldNames
-      });
-
-      const lhsOrdering = `${
-        orderByParam
-          ? usesTemporalOrdering
-            ? `[sortedElement IN apoc.coll.sortMulti(`
-            : `apoc.coll.sortMulti(`
-          : ''
-      }`;
-
-      const rhsOrdering = `${
-        orderByParam
-          ? `, [${buildSortMultiArgs(orderByParam)}])${
-              usesTemporalOrdering
-                ? ` | sortedElement { .* ${
-                    neo4jTypeFieldSelections
-                      ? `,  ${neo4jTypeFieldSelections}`
-                      : ''
-                  }}]`
-                : ``
-            }`
-          : ''
-      }`;
-
+    if (isReflexiveRelationshipOutputType({ schemaType })) {
+      isFromField = schemaType.astNode.fields[0].name.value === fieldName;
+      isToField = schemaType.astNode.fields[1].name.value === fieldName;
       const temporalFieldRelationshipVariableName = `${nestedVariable}_relation`;
       const neo4jTypeClauses = neo4jTypePredicateClauses(
         filterParams,
@@ -743,6 +651,13 @@ const directedNodeTypeFieldOnRelationType = ({
         resolveInfo
       });
 
+      const [lhsOrdering, rhsOrdering] = translateNestedOrderingArgument({
+        schemaType: innerSchemaType,
+        selections: fieldsForTranslation,
+        fieldSelectionSet,
+        filterParams
+      });
+
       const whereClauses = [
         ...neo4jTypeClauses,
         ...filterPredicates,
@@ -758,9 +673,9 @@ const directedNodeTypeFieldOnRelationType = ({
       )}${queryParams}]-${isToField ? '>' : ''}(${safeVar(
         nestedVariable
       )}:${safeLabel([
-        fromTypeName,
+        parentSchemaTypeName,
         ...getAdditionalLabels(
-          resolveInfo.schema.getType(fromTypeName),
+          resolveInfo.schema.getType(parentSchemaTypeName),
           cypherParams
         )
       ])}) ${
@@ -836,12 +751,7 @@ export const neo4jTypeField = ({
   let fieldIsArray = isArrayType(parentFieldType);
   if (parentSchemaType && !isNodeType(parentSchemaType.astNode)) {
     // initial assumption wrong, build appropriate relationship variable
-    if (
-      isRootSelection({
-        selectionInfo: secondParentSelectionInfo,
-        rootType: 'relationship'
-      })
-    ) {
+    if (isRelationshipMutationOutputType({ schemaType: parentSchemaType })) {
       // If the second parent selection scope above is the root
       // then we need to use the root variableName
       variableName = `${secondParentVariableName}_relation`;
@@ -912,12 +822,7 @@ export const neo4jType = ({
       variableName = `${nestedVariable}_${relationshipVariableSuffix}`;
     } else {
       if (fieldIsArray) {
-        if (
-          isRootSelection({
-            selectionInfo: parentSelectionInfo,
-            rootType: 'relationship'
-          })
-        ) {
+        if (isRelationshipMutationOutputType({ schemaType })) {
           variableName = `${parentVariableName}_${relationshipVariableSuffix}`;
         } else {
           variableName = `${variableName}_${relationshipVariableSuffix}`;
@@ -1171,7 +1076,7 @@ const buildTypeCompositionPredicate = ({
   return labelPredicate;
 };
 
-const getCypherParams = context => {
+export const getCypherParams = context => {
   return context &&
     context.cypherParams &&
     context.cypherParams instanceof Object &&
@@ -1351,7 +1256,38 @@ const nodeQuery = ({
     usesFragments
   });
 
+  let fullTextSearchStatement = '';
+  let fullTextScorePredicate = '';
+  const searchArg = fieldArgs.find(
+    arg => arg.name.value === SearchArgument.SEARCH
+  );
+  const searchValue = params[SearchArgument.SEARCH];
+  if (searchArg && searchValue) {
+    const scoreThreshold = searchValue['threshold'];
+    const searchIndexes = Object.keys(searchValue).filter(
+      key => key !== 'threshold'
+    );
+    if (searchIndexes.length === 0) {
+      throw new ApolloError(
+        `At least one argument for a search index must be provided.`
+      );
+    } else if (searchIndexes.length > 1) {
+      throw new ApolloError(
+        `Only one argument for a search index can be provided.`
+      );
+    }
+    const searchIndexName = searchIndexes[0];
+    const searchArgValue = searchValue[searchIndexName];
+    fullTextSearchStatement = `CALL db.index.fulltext.queryNodes("${searchIndexName}", "${searchArgValue}") YIELD node AS ${safeVariableName}`;
+    if (scoreThreshold) {
+      fullTextSearchStatement = `${fullTextSearchStatement}, score`;
+      // threshold argument used as statistical floor to filter over results from single search index argument
+      fullTextScorePredicate = `score >= ${scoreThreshold}`;
+    }
+  }
+
   const predicateClauses = [
+    fullTextScorePredicate,
     idWherePredicate,
     labelPredicate,
     ...filterPredicates,
@@ -1365,11 +1301,11 @@ const nodeQuery = ({
   const predicate = predicateClauses ? `WHERE ${predicateClauses} ` : '';
   const { optimization, cypherPart: orderByClause } = orderByValue;
 
-  if ('text' in params) {
+  /*  if ('text' in params) {
     let querystring = params.text;
     // let subQuery = subQuery.replace('.score', 'score');
     //let orderByClause = orderByClause.replace('work.score', 'score');
-    let query = `CALL db.index.fulltext.queryNodes('${variableName}', '${querystring}') yield node as ${safeVariableName}, score 
+    let query = `CALL db.index.fulltext.queryNodes('${variableName}', '${querystring}') yield node as ${safeVariableName}, score
       ${predicate}${
       optimization.earlyOrderBy
         ? `WITH ${safeVariableName}${orderByClause}`
@@ -1393,10 +1329,24 @@ const nodeQuery = ({
     console.log(params);
     console.log(query);
     return [query, { ...params, ...fragmentTypeParams }];
-  }
+  } */
+
+  let query = `${
+    fullTextSearchStatement
+      ? `${fullTextSearchStatement} `
+      : `MATCH (${safeVariableName}:${safeLabelName}${
+          argString ? ` ${argString}` : ''
+        })`
+  } ${predicate}${
+    optimization.earlyOrderBy ? `WITH ${safeVariableName}${orderByClause}` : ''
+  }RETURN ${mapProjection} AS ${safeVariableName}${
+    optimization.earlyOrderBy ? '' : orderByClause
+  }${outerSkipLimit}`;
+
+  return [query, { ...params, ...fragmentTypeParams }];
 };
 
-const buildMapProjection = ({
+export const buildMapProjection = ({
   schemaType,
   schemaTypeFields,
   listVariable,
@@ -1450,850 +1400,24 @@ const buildMapProjection = ({
   return [mapProjection, labelPredicate];
 };
 
-const getUnionLabels = ({ typeName = '', typeMap = {} }) => {
-  const unionLabels = [];
-  Object.keys(typeMap).map(key => {
-    const definition = typeMap[key];
-    const astNode = definition.astNode;
-    if (isUnionTypeDefinition({ definition: astNode })) {
-      const types = definition.getTypes();
-      const unionTypeName = definition.name;
-      if (types.find(type => type.name === typeName)) {
-        unionLabels.push(unionTypeName);
-      }
-    }
-  });
-  return unionLabels;
-};
-
-// Mutation API root operation branch
-export const translateMutation = ({
-  resolveInfo,
-  context,
-  first,
-  offset,
-  otherParams
-}) => {
-  const typeMap = resolveInfo.schema.getTypeMap();
-  const { typeName, variableName } = typeIdentifiers(resolveInfo.returnType);
-  const schemaType = resolveInfo.schema.getType(typeName);
-  const selections = getPayloadSelections(resolveInfo);
-  const outerSkipLimit = getOuterSkipLimit(first, offset);
-  const orderByValue = computeOrderBy(resolveInfo, schemaType);
-  const additionalNodeLabels = getAdditionalLabels(
-    schemaType,
-    getCypherParams(context)
-  );
-  const mutationTypeCypherDirective = getMutationCypherDirective(resolveInfo);
-  const mutationMeta = resolveInfo.schema
-    .getMutationType()
-    .getFields()
-    [resolveInfo.fieldName].astNode.directives.find(x => {
-      return x.name.value === 'MutationMeta';
-    });
-
-  const fieldArguments = getMutationArguments(resolveInfo);
-  const serializedParams = analyzeMutationArguments({
-    fieldArguments,
-    values: otherParams,
-    resolveInfo
-  });
-  const params = initializeMutationParams({
-    mutationMeta,
-    resolveInfo,
-    mutationTypeCypherDirective,
-    first,
-    otherParams: serializedParams,
-    offset
-  });
-
-  const isInterfaceType = isGraphqlInterfaceType(schemaType);
-  const isObjectType = isGraphqlObjectType(schemaType);
-  const isUnionType = isGraphqlUnionType(schemaType);
-
-  const usesFragments = isFragmentedSelection({ selections });
-  const isFragmentedObjectType = usesFragments && isObjectType;
-  const isFragmentedInterfaceType = usesFragments && isInterfaceType;
-
-  const interfaceLabels =
-    typeof schemaType.getInterfaces === 'function'
-      ? schemaType.getInterfaces().map(i => i.name)
-      : [];
-
-  const unionLabels = getUnionLabels({ typeName, typeMap });
-  const additionalLabels = [
-    ...additionalNodeLabels,
-    ...interfaceLabels,
-    ...unionLabels
-  ];
-
-  const [schemaTypeFields, derivedTypeMap] = mergeSelectionFragments({
-    schemaType,
-    selections,
-    isFragmentedObjectType,
-    isFragmentedInterfaceType,
-    isUnionType,
-    typeMap,
-    resolveInfo
-  });
-
-  let translation = ``;
-  let translationParams = {};
-  if (mutationTypeCypherDirective) {
-    [translation, translationParams] = customMutation({
-      resolveInfo,
-      schemaType,
-      schemaTypeFields,
-      derivedTypeMap,
-      isObjectType,
-      isInterfaceType,
-      isUnionType,
-      usesFragments,
-      selections,
-      params,
-      context,
-      mutationTypeCypherDirective,
-      variableName,
-      orderByValue,
-      outerSkipLimit
-    });
-  } else if (isCreateMutation(resolveInfo)) {
-    [translation, translationParams] = nodeCreate({
-      resolveInfo,
-      schemaType,
-      selections,
-      params,
-      context,
-      variableName,
-      typeName,
-      additionalLabels
-    });
-  } else if (isDeleteMutation(resolveInfo)) {
-    [translation, translationParams] = nodeDelete({
-      resolveInfo,
-      schemaType,
-      selections,
-      params,
-      variableName,
-      typeName
-    });
-  } else if (isAddMutation(resolveInfo)) {
-    [translation, translationParams] = relationshipCreate({
-      resolveInfo,
-      schemaType,
-      selections,
-      params,
-      context
-    });
-  } else if (isUpdateMutation(resolveInfo) || isMergeMutation(resolveInfo)) {
-    /**
-     * TODO: Once we are no longer using the @MutationMeta directive
-     * on relationship mutations, we will need to more directly identify
-     * whether this Merge mutation if for a node or relationship
-     */
-    if (mutationMeta) {
-      [translation, translationParams] = relationshipMergeOrUpdate({
-        mutationMeta,
-        resolveInfo,
-        selections,
-        schemaType,
-        params,
-        context
-      });
-    } else {
-      [translation, translationParams] = nodeMergeOrUpdate({
-        resolveInfo,
-        variableName,
-        typeName,
-        selections,
-        schemaType,
-        additionalLabels,
-        params,
-        context
-      });
-    }
-  } else if (isRemoveMutation(resolveInfo)) {
-    [translation, translationParams] = relationshipDelete({
-      resolveInfo,
-      schemaType,
-      selections,
-      params,
-      context
-    });
-  } else {
-    // throw error - don't know how to handle this type of mutation
-    throw new Error(
-      'Do not know how to handle this type of mutation. Mutation does not follow naming convention.'
-    );
-  }
-  return [translation, translationParams];
-};
-
-// Custom write operation
-const customMutation = ({
-  params,
-  context,
-  mutationTypeCypherDirective,
-  selections,
-  variableName,
-  schemaType,
-  schemaTypeFields,
-  derivedTypeMap,
-  isObjectType,
-  isInterfaceType,
-  isUnionType,
-  usesFragments,
-  resolveInfo,
-  orderByValue,
-  outerSkipLimit
-}) => {
-  const cypherParams = getCypherParams(context);
-  const safeVariableName = safeVar(variableName);
-  // FIXME: support IN for multiple values -> WHERE
-  const argString = paramsToString(
-    innerFilterParams(
-      getFilterParams(params.params || params),
-      null,
-      null,
-      true
-    ),
-    cypherParams
-  );
-  const cypherQueryArg = mutationTypeCypherDirective.arguments.find(x => {
-    return x.name.value === 'statement';
-  });
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    variableName,
-    schemaType,
-    resolveInfo,
-    cypherParams
-  });
-  const isScalarType = isGraphqlScalarType(schemaType);
-  const isNeo4jTypeOutput = isNeo4jType(schemaType.name);
-  const isScalarField = isNeo4jTypeOutput || isScalarType;
-  const { cypherPart: orderByClause } = orderByValue;
-  const listVariable = `apoc.map.values(value, [keys(value)[0]])[0] `;
-  const [mapProjection, labelPredicate] = buildMapProjection({
-    isComputedMutation: true,
-    listVariable,
-    schemaType,
-    schemaTypeFields,
-    derivedTypeMap,
-    isObjectType,
-    isInterfaceType,
-    isUnionType,
-    usesFragments,
-    safeVariableName,
-    subQuery,
-    resolveInfo
-  });
-  let query = '';
-  if (labelPredicate) {
-    query = `CALL apoc.cypher.doIt("${
-      cypherQueryArg.value.value
-    }", ${argString}) YIELD value
-    ${!isScalarField ? labelPredicate : ''}AS ${safeVariableName}
-    RETURN ${
-      !isScalarField
-        ? `${mapProjection} AS ${safeVariableName}${orderByClause}${outerSkipLimit}`
-        : ''
-    }`;
-  } else {
-    query = `CALL apoc.cypher.doIt("${
-      cypherQueryArg.value.value
-    }", ${argString}) YIELD value
-    WITH ${listVariable}AS ${safeVariableName}
-    RETURN ${safeVariableName} ${
-      !isScalarField
-        ? `{${
-            isInterfaceType
-              ? `${fragmentType(safeVariableName, schemaType.name)},`
-              : ''
-          }${subQuery}} AS ${safeVariableName}${orderByClause}${outerSkipLimit}`
-        : ''
-    }`;
-  }
-  const fragmentTypeParams = derivedTypesParams({
-    isInterfaceType,
-    isUnionType,
-    schema: resolveInfo.schema,
-    schemaTypeName: schemaType.name,
-    usesFragments
-  });
-  params = { ...params, ...subParams, ...fragmentTypeParams };
-  if (cypherParams) {
-    params['cypherParams'] = cypherParams;
-  }
-  return [query, { ...params }];
-};
-
-// Generated API
-// Node Create - Update - Delete
-const nodeCreate = ({
-  variableName,
-  typeName,
-  selections,
-  schemaType,
-  resolveInfo,
-  additionalLabels,
-  params,
-  context
-}) => {
-  const safeVariableName = safeVar(variableName);
-  const safeLabelName = safeLabel([typeName, ...additionalLabels]);
-  let statements = [];
-  const args = getMutationArguments(resolveInfo);
-  const fieldMap = schemaType.getFields();
-  const fields = Object.values(fieldMap).map(field => field.astNode);
-  const primaryKey = getPrimaryKey({ fields });
-  statements = setPrimaryKeyValue({
-    args,
-    statements,
-    params: params.params,
-    primaryKey
-  });
-  const paramStatements = buildCypherParameters({
-    args,
-    statements,
-    params,
-    paramKey: 'params',
-    resolveInfo
-  });
-
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    variableName,
-    schemaType,
-    resolveInfo,
-    cypherParams: getCypherParams(context)
-  });
-  params = { ...params, ...subParams };
-  const query = `
-    CREATE (${safeVariableName}:${safeLabelName} {${paramStatements.join(',')}})
-    RETURN ${safeVariableName} {${subQuery}} AS ${safeVariableName}
-  `;
-  return [query, params];
-};
-
-const nodeDelete = ({
-  resolveInfo,
-  selections,
-  variableName,
-  typeName,
-  schemaType,
-  params
-}) => {
-  const safeVariableName = safeVar(variableName);
-  const safeLabelName = safeLabel(typeName);
-  const args = getMutationArguments(resolveInfo);
-  const fieldMap = schemaType.getFields();
-  const fields = Object.values(fieldMap).map(field => field.astNode);
-  const primaryKey = getPrimaryKey({ fields });
-  const primaryKeyArgName = primaryKey.name.value;
-  const neo4jTypeArgs = getNeo4jTypeArguments(args);
-  const [primaryKeyParam] = splitSelectionParameters(params, primaryKeyArgName);
-  const neo4jTypeClauses = neo4jTypePredicateClauses(
-    primaryKeyParam,
-    safeVariableName,
-    neo4jTypeArgs
-  );
-  let query = `MATCH (${safeVariableName}:${safeLabelName}${
-    neo4jTypeClauses.length > 0
-      ? `) WHERE ${neo4jTypeClauses.join(' AND ')}`
-      : ` {${primaryKeyArgName}: $${primaryKeyArgName}})`
-  }`;
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    variableName,
-    schemaType,
-    resolveInfo
-  });
-  params = { ...params, ...subParams };
-  const deletionVariableName = safeVar(`${variableName}_toDelete`);
-  // Cannot execute a map projection on a deleted node in Neo4j
-  // so the projection is executed and aliased before the delete
-  query += `
-WITH ${safeVariableName} AS ${deletionVariableName}, ${safeVariableName} {${subQuery}} AS ${safeVariableName}
-DETACH DELETE ${deletionVariableName}
-RETURN ${safeVariableName}`;
-  return [query, params];
-};
-
-// Relation Add / Remove
-const relationshipCreate = ({
-  resolveInfo,
-  selections,
-  schemaType,
-  params,
-  context
-}) => {
-  let mutationMeta, relationshipNameArg, fromTypeArg, toTypeArg;
-  try {
-    mutationMeta = resolveInfo.schema
-      .getMutationType()
-      .getFields()
-      [resolveInfo.fieldName].astNode.directives.find(x => {
-        return x.name.value === 'MutationMeta';
-      });
-  } catch (e) {
-    throw new Error(
-      'Missing required MutationMeta directive on add relationship directive'
-    );
-  }
-
-  try {
-    relationshipNameArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'relationship';
-    });
-    fromTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'from';
-    });
-    toTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'to';
-    });
-  } catch (e) {
-    throw new Error(
-      'Missing required argument in MutationMeta directive (relationship, from, or to)'
-    );
-  }
-
-  //TODO: need to handle one-to-one and one-to-many
-  const args = getMutationArguments(resolveInfo);
-  const typeMap = resolveInfo.schema.getTypeMap();
-  const cypherParams = getCypherParams(context);
-  const fromType = fromTypeArg.value.value;
-  const fromVar = `${lowFirstLetter(fromType)}_from`;
-  const fromInputArg = args.find(e => e.name.value === 'from').type;
-  const fromInputAst =
-    typeMap[getNamedType(fromInputArg).type.name.value].astNode;
-  const fromFields = fromInputAst.fields;
-  const fromParam = fromFields[0].name.value;
-  const fromNodeNeo4jTypeArgs = getNeo4jTypeArguments(fromFields);
-
-  const toType = toTypeArg.value.value;
-  const toVar = `${lowFirstLetter(toType)}_to`;
-  const toInputArg = args.find(e => e.name.value === 'to').type;
-  const toInputAst = typeMap[getNamedType(toInputArg).type.name.value].astNode;
-  const toFields = toInputAst.fields;
-  const toParam = toFields[0].name.value;
-  const toNodeNeo4jTypeArgs = getNeo4jTypeArguments(toFields);
-
-  const relationshipName = relationshipNameArg.value.value;
-  const lowercased = relationshipName.toLowerCase();
-  const dataInputArg = args.find(e => e.name.value === 'data');
-  const dataInputAst = dataInputArg
-    ? typeMap[getNamedType(dataInputArg.type).type.name.value].astNode
-    : undefined;
-  const dataFields = dataInputAst ? dataInputAst.fields : [];
-
-  const paramStatements = buildCypherParameters({
-    args: dataFields,
-    params,
-    paramKey: 'data',
-    resolveInfo
-  });
-  const schemaTypeName = safeVar(schemaType);
-  const fromVariable = safeVar(fromVar);
-  const fromAdditionalLabels = getAdditionalLabels(
-    resolveInfo.schema.getType(fromType),
-    cypherParams
-  );
-  const fromLabel = safeLabel([fromType, ...fromAdditionalLabels]);
-  const toVariable = safeVar(toVar);
-  const toAdditionalLabels = getAdditionalLabels(
-    resolveInfo.schema.getType(toType),
-    cypherParams
-  );
-  const toLabel = safeLabel([toType, ...toAdditionalLabels]);
-  const relationshipVariable = safeVar(lowercased + '_relation');
-  const relationshipLabel = safeLabel(relationshipName);
-  const fromNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-    params.from,
-    fromVariable,
-    fromNodeNeo4jTypeArgs,
-    'from'
-  );
-  const toNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-    params.to,
-    toVariable,
-    toNodeNeo4jTypeArgs,
-    'to'
-  );
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    schemaType,
-    resolveInfo,
-    parentSelectionInfo: {
-      rootType: 'relationship',
-      from: fromVar,
-      to: toVar,
-      variableName: lowercased
-    },
-    cypherParams: getCypherParams(context)
-  });
-  params = { ...params, ...subParams };
-  let query = `
-      MATCH (${fromVariable}:${fromLabel}${
-    fromNodeNeo4jTypeClauses && fromNodeNeo4jTypeClauses.length > 0
-      ? // uses either a WHERE clause for managed type primary keys (temporal, etc.)
-        `) WHERE ${fromNodeNeo4jTypeClauses.join(' AND ')} `
-      : // or a an internal matching clause for normal, scalar property primary keys
-        // NOTE this will need to change if we at some point allow for multi field node selection
-        ` {${fromParam}: $from.${fromParam}})`
-  }
-      MATCH (${toVariable}:${toLabel}${
-    toNodeNeo4jTypeClauses && toNodeNeo4jTypeClauses.length > 0
-      ? `) WHERE ${toNodeNeo4jTypeClauses.join(' AND ')} `
-      : ` {${toParam}: $to.${toParam}})`
-  }
-      CREATE (${fromVariable})-[${relationshipVariable}:${relationshipLabel}${
-    paramStatements.length > 0 ? ` {${paramStatements.join(',')}}` : ''
-  }]->(${toVariable})
-      RETURN ${relationshipVariable} { ${subQuery} } AS ${schemaTypeName};
-    `;
-  return [query, params];
-};
-
-const relationshipDelete = ({
-  resolveInfo,
-  selections,
-  schemaType,
-  params,
-  context
-}) => {
-  let mutationMeta, relationshipNameArg, fromTypeArg, toTypeArg;
-  try {
-    mutationMeta = resolveInfo.schema
-      .getMutationType()
-      .getFields()
-      [resolveInfo.fieldName].astNode.directives.find(x => {
-        return x.name.value === 'MutationMeta';
-      });
-  } catch (e) {
-    throw new Error(
-      'Missing required MutationMeta directive on add relationship directive'
-    );
-  }
-
-  try {
-    relationshipNameArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'relationship';
-    });
-    fromTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'from';
-    });
-    toTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'to';
-    });
-  } catch (e) {
-    throw new Error(
-      'Missing required argument in MutationMeta directive (relationship, from, or to)'
-    );
-  }
-
-  //TODO: need to handle one-to-one and one-to-many
-  const args = getMutationArguments(resolveInfo);
-  const typeMap = resolveInfo.schema.getTypeMap();
-  const cypherParams = getCypherParams(context);
-
-  const fromType = fromTypeArg.value.value;
-  const fromVar = `${lowFirstLetter(fromType)}_from`;
-  const fromInputArg = args.find(e => e.name.value === 'from').type;
-  const fromInputAst =
-    typeMap[getNamedType(fromInputArg).type.name.value].astNode;
-  const fromFields = fromInputAst.fields;
-  const fromParam = fromFields[0].name.value;
-  const fromNodeNeo4jTypeArgs = getNeo4jTypeArguments(fromFields);
-
-  const toType = toTypeArg.value.value;
-  const toVar = `${lowFirstLetter(toType)}_to`;
-  const toInputArg = args.find(e => e.name.value === 'to').type;
-  const toInputAst = typeMap[getNamedType(toInputArg).type.name.value].astNode;
-  const toFields = toInputAst.fields;
-  const toParam = toFields[0].name.value;
-  const toNodeNeo4jTypeArgs = getNeo4jTypeArguments(toFields);
-
-  const relationshipName = relationshipNameArg.value.value;
-
-  const schemaTypeName = safeVar(schemaType);
-  const fromVariable = safeVar(fromVar);
-  const fromAdditionalLabels = getAdditionalLabels(
-    resolveInfo.schema.getType(fromType),
-    cypherParams
-  );
-  const fromLabel = safeLabel([fromType, ...fromAdditionalLabels]);
-  const toVariable = safeVar(toVar);
-  const toAdditionalLabels = getAdditionalLabels(
-    resolveInfo.schema.getType(toType),
-    cypherParams
-  );
-  const toLabel = safeLabel([toType, ...toAdditionalLabels]);
-  const relationshipVariable = safeVar(fromVar + toVar);
-  const relationshipLabel = safeLabel(relationshipName);
-  const fromRootVariable = safeVar('_' + fromVar);
-  const toRootVariable = safeVar('_' + toVar);
-  const fromNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-    params.from,
-    fromVariable,
-    fromNodeNeo4jTypeArgs,
-    'from'
-  );
-  const toNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-    params.to,
-    toVariable,
-    toNodeNeo4jTypeArgs,
-    'to'
-  );
-  // TODO cleaner semantics: remove use of _ prefixes in root variableNames and variableName
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    schemaType,
-    resolveInfo,
-    parentSelectionInfo: {
-      rootType: 'relationship',
-      from: `_${fromVar}`,
-      to: `_${toVar}`
-    },
-    cypherParams: getCypherParams(context)
-  });
-  params = { ...params, ...subParams };
-  let query = `
-      MATCH (${fromVariable}:${fromLabel}${
-    fromNodeNeo4jTypeClauses && fromNodeNeo4jTypeClauses.length > 0
-      ? // uses either a WHERE clause for managed type primary keys (temporal, etc.)
-        `) WHERE ${fromNodeNeo4jTypeClauses.join(' AND ')} `
-      : // or a an internal matching clause for normal, scalar property primary keys
-        ` {${fromParam}: $from.${fromParam}})`
-  }
-      MATCH (${toVariable}:${toLabel}${
-    toNodeNeo4jTypeClauses && toNodeNeo4jTypeClauses.length > 0
-      ? `) WHERE ${toNodeNeo4jTypeClauses.join(' AND ')} `
-      : ` {${toParam}: $to.${toParam}})`
-  }
-      OPTIONAL MATCH (${fromVariable})-[${relationshipVariable}:${relationshipLabel}]->(${toVariable})
-      DELETE ${relationshipVariable}
-      WITH COUNT(*) AS scope, ${fromVariable} AS ${fromRootVariable}, ${toVariable} AS ${toRootVariable}
-      RETURN {${subQuery}} AS ${schemaTypeName};
-    `;
-  return [query, params];
-};
-
-const relationshipMergeOrUpdate = ({
-  mutationMeta,
-  resolveInfo,
-  selections,
-  schemaType,
-  params,
-  context
-}) => {
-  let query = '';
-  let relationshipNameArg = undefined;
-  let fromTypeArg = undefined;
-  let toTypeArg = undefined;
-  try {
-    relationshipNameArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'relationship';
-    });
-    fromTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'from';
-    });
-    toTypeArg = mutationMeta.arguments.find(x => {
-      return x.name.value === 'to';
-    });
-  } catch (e) {
-    throw new Error(
-      'Missing required argument in MutationMeta directive (relationship, from, or to)'
-    );
-  }
-  if (relationshipNameArg && fromTypeArg && toTypeArg) {
-    //TODO: need to handle one-to-one and one-to-many
-    const args = getMutationArguments(resolveInfo);
-    const typeMap = resolveInfo.schema.getTypeMap();
-    const cypherParams = getCypherParams(context);
-    const fromType = fromTypeArg.value.value;
-    const fromVar = `${lowFirstLetter(fromType)}_from`;
-    const fromInputArg = args.find(e => e.name.value === 'from').type;
-    const fromInputAst =
-      typeMap[getNamedType(fromInputArg).type.name.value].astNode;
-    const fromFields = fromInputAst.fields;
-    const fromParam = fromFields[0].name.value;
-    const fromNodeNeo4jTypeArgs = getNeo4jTypeArguments(fromFields);
-
-    const toType = toTypeArg.value.value;
-    const toVar = `${lowFirstLetter(toType)}_to`;
-    const toInputArg = args.find(e => e.name.value === 'to').type;
-    const toInputAst =
-      typeMap[getNamedType(toInputArg).type.name.value].astNode;
-    const toFields = toInputAst.fields;
-    const toParam = toFields[0].name.value;
-    const toNodeNeo4jTypeArgs = getNeo4jTypeArguments(toFields);
-
-    const relationshipName = relationshipNameArg.value.value;
-    const lowercased = relationshipName.toLowerCase();
-    const dataInputArg = args.find(e => e.name.value === 'data');
-    const dataInputAst = dataInputArg
-      ? typeMap[getNamedType(dataInputArg.type).type.name.value].astNode
-      : undefined;
-    const dataFields = dataInputAst ? dataInputAst.fields : [];
-
-    const paramStatements = buildCypherParameters({
-      args: dataFields,
-      params,
-      paramKey: 'data',
-      resolveInfo
-    });
-    const schemaTypeName = safeVar(schemaType);
-    const fromVariable = safeVar(fromVar);
-    const fromAdditionalLabels = getAdditionalLabels(
-      resolveInfo.schema.getType(fromType),
-      cypherParams
-    );
-    const fromLabel = safeLabel([fromType, ...fromAdditionalLabels]);
-    const toVariable = safeVar(toVar);
-    const toAdditionalLabels = getAdditionalLabels(
-      resolveInfo.schema.getType(toType),
-      cypherParams
-    );
-    const toLabel = safeLabel([toType, ...toAdditionalLabels]);
-    const relationshipVariable = safeVar(lowercased + '_relation');
-    const relationshipLabel = safeLabel(relationshipName);
-    const fromNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-      params.from,
-      fromVariable,
-      fromNodeNeo4jTypeArgs,
-      'from'
-    );
-    const toNodeNeo4jTypeClauses = neo4jTypePredicateClauses(
-      params.to,
-      toVariable,
-      toNodeNeo4jTypeArgs,
-      'to'
-    );
-    const [subQuery, subParams] = buildCypherSelection({
-      selections,
-      schemaType,
-      resolveInfo,
-      parentSelectionInfo: {
-        rootType: 'relationship',
-        from: fromVar,
-        to: toVar,
-        variableName: lowercased
-      },
-      cypherParams: getCypherParams(context)
-    });
-    let cypherOperation = '';
-    if (isMergeMutation(resolveInfo)) {
-      cypherOperation = 'MERGE';
-    } else if (isUpdateMutation(resolveInfo)) {
-      cypherOperation = 'MATCH';
-    }
-    params = { ...params, ...subParams };
-    query = `
-      MATCH (${fromVariable}:${fromLabel}${
-      fromNodeNeo4jTypeClauses && fromNodeNeo4jTypeClauses.length > 0
-        ? // uses either a WHERE clause for managed type primary keys (temporal, etc.)
-          `) WHERE ${fromNodeNeo4jTypeClauses.join(' AND ')} `
-        : // or a an internal matching clause for normal, scalar property primary keys
-          // NOTE this will need to change if we at some point allow for multi field node selection
-          ` {${fromParam}: $from.${fromParam}})`
-    }
-      MATCH (${toVariable}:${toLabel}${
-      toNodeNeo4jTypeClauses && toNodeNeo4jTypeClauses.length > 0
-        ? `) WHERE ${toNodeNeo4jTypeClauses.join(' AND ')} `
-        : ` {${toParam}: $to.${toParam}})`
-    }
-      ${cypherOperation} (${fromVariable})-[${relationshipVariable}:${relationshipLabel}]->(${toVariable})${
-      paramStatements.length > 0
-        ? `
-      SET ${relationshipVariable} += {${paramStatements.join(',')}} `
-        : ''
-    }
-      RETURN ${relationshipVariable} { ${subQuery} } AS ${schemaTypeName};
-    `;
-  }
-  return [query, params];
-};
-
-const nodeMergeOrUpdate = ({
-  resolveInfo,
-  variableName,
-  typeName,
-  selections,
-  schemaType,
-  additionalLabels,
-  params,
-  context
-}) => {
-  const safeVariableName = safeVar(variableName);
-  const args = getMutationArguments(resolveInfo);
-  const fieldMap = schemaType.getFields();
-  const fields = Object.values(fieldMap).map(field => field.astNode);
-  const primaryKey = getPrimaryKey({ fields });
-  const primaryKeyArgName = primaryKey.name.value;
-  const neo4jTypeArgs = getNeo4jTypeArguments(args);
-  const [primaryKeyParam, updateParams] = splitSelectionParameters(
-    params,
-    primaryKeyArgName,
-    'params'
-  );
-  const neo4jTypeClauses = neo4jTypePredicateClauses(
-    primaryKeyParam,
-    safeVariableName,
-    neo4jTypeArgs,
-    'params'
-  );
-  const predicateClauses = [...neo4jTypeClauses]
-    .filter(predicate => !!predicate)
-    .join(' AND ');
-  const predicate = predicateClauses ? `WHERE ${predicateClauses} ` : '';
-  let paramUpdateStatements = buildCypherParameters({
-    args,
-    params: updateParams,
-    paramKey: 'params',
-    resolveInfo,
-    cypherParams: getCypherParams(context)
-  });
-  let cypherOperation = '';
-  let safeLabelName = safeLabel(typeName);
-  if (isMergeMutation(resolveInfo)) {
-    safeLabelName = safeLabel([typeName, ...additionalLabels]);
-    cypherOperation = 'MERGE';
-  } else if (isUpdateMutation(resolveInfo)) {
-    cypherOperation = 'MATCH';
-  }
-  let query = `${cypherOperation} (${safeVariableName}:${safeLabelName}${
-    predicate !== ''
-      ? `) ${predicate} `
-      : `{${primaryKeyArgName}: $params.${primaryKeyArgName}})`
-  }
-  `;
-  if (paramUpdateStatements.length > 0) {
-    query += `SET ${safeVariableName} += {${paramUpdateStatements.join(',')}} `;
-  }
-  const [subQuery, subParams] = buildCypherSelection({
-    selections,
-    variableName,
-    schemaType,
-    resolveInfo,
-    cypherParams: getCypherParams(context)
-  });
-  if (!params.params) params.params = {};
-  params.params[primaryKeyArgName] = primaryKeyParam[primaryKeyArgName];
-  params = { ...params, ...subParams };
-  query += `RETURN ${safeVariableName} {${subQuery}} AS ${safeVariableName}`;
-  return [query, params];
-};
-
-const buildOrderedNeo4jTypeSelections = ({
+const translateNestedOrderingArgument = ({
   schemaType,
   selections,
-  usesTemporalOrdering,
-  selectedFieldNames
+  fieldSelectionSet,
+  filterParams
 }) => {
-  let neo4jTypeSelections = '';
+  const orderByParam = filterParams['orderBy'];
+  const usesTemporalOrdering = temporalOrderingFieldExists(
+    schemaType,
+    filterParams
+  );
+  const selectedFieldNames = fieldSelectionSet.reduce((fieldNames, field) => {
+    if (field.name) fieldNames.push(field.name.value);
+    return fieldNames;
+  }, []);
+  let neo4jTypeFieldSelections = '';
   if (usesTemporalOrdering) {
-    neo4jTypeSelections = selections
+    neo4jTypeFieldSelections = selections
       .reduce((temporalTypeFields, innerSelection) => {
         // name of temporal type field
         const fieldName = innerSelection.name.value;
@@ -2306,7 +1430,6 @@ const buildOrderedNeo4jTypeSelections = ({
           const innerSelectedTypes = innerSelection.selectionSet
             ? innerSelection.selectionSet.selections
             : [];
-
           temporalTypeFields.push(
             `${fieldName}: {${innerSelectedTypes
               .reduce((temporalSubFields, t) => {
@@ -2330,7 +1453,21 @@ const buildOrderedNeo4jTypeSelections = ({
       }, [])
       .join(',');
   }
-  return neo4jTypeSelections;
+  const lhsOrdering = orderByParam
+    ? usesTemporalOrdering
+      ? `[sortedElement IN apoc.coll.sortMulti(`
+      : `apoc.coll.sortMulti(`
+    : '';
+  const rhsOrdering = orderByParam
+    ? `, [${buildSortMultiArgs(orderByParam)}])${
+        usesTemporalOrdering
+          ? ` | sortedElement { .* ${
+              neo4jTypeFieldSelections ? `,  ${neo4jTypeFieldSelections}` : ''
+            }}]`
+          : ``
+      }`
+    : '';
+  return [lhsOrdering, rhsOrdering];
 };
 
 const getFieldTypeName = (schemaType, fieldName) => {
@@ -2365,7 +1502,8 @@ const buildSortMultiArgs = param => {
     .join(',');
 };
 
-const processFilterArgument = ({
+export const processFilterArgument = ({
+  argumentName = 'filter',
   fieldArgs,
   isFederatedOperation,
   schemaType,
@@ -2376,9 +1514,12 @@ const processFilterArgument = ({
   parentSchemaType,
   rootIsRelationType = false
 }) => {
-  const filterArg = fieldArgs.find(e => e.name.value === 'filter');
-  const filterValue = Object.keys(params).length ? params['filter'] : undefined;
-  const filterParamKey = paramIndex > 1 ? `${paramIndex - 1}_filter` : `filter`;
+  const filterArg = fieldArgs.find(e => e.name.value === argumentName);
+  const filterValue = Object.keys(params).length
+    ? params[argumentName]
+    : undefined;
+  const filterParamKey =
+    paramIndex > 1 ? `${paramIndex - 1}_${argumentName}` : argumentName;
   const filterCypherParam = `$${filterParamKey}`;
   let translations = [];
   // allows an exception for the existence of the filter argument AST
@@ -2829,6 +1970,7 @@ const parseFilterArgumentName = fieldName => {
     '_not',
     '_in',
     '_not_in',
+    '_regexp',
     '_contains',
     '_not_contains',
     '_starts_with',
@@ -2975,6 +2117,8 @@ const buildOperatorExpression = ({
       return `${propertyPath} IN`;
     case 'not_in':
       return `NOT ${propertyPath} IN`;
+    case 'regexp':
+      return `${propertyPath} =~`;
     case 'contains':
       return `${propertyPath} CONTAINS`;
     case 'not_contains':
@@ -3092,7 +2236,7 @@ const translateInputFilter = ({
           nullFieldPredicate
         });
       } else if (isRelation || isRelationType || isRelationTypeNode) {
-        return translateRelationFilter({
+        const filterTranslation = translateRelationFilter({
           rootIsRelationType,
           thisType,
           relatedType,
@@ -3118,6 +2262,7 @@ const translateInputFilter = ({
           parentSchemaType,
           parentFieldName
         });
+        return filterTranslation;
       }
     }
   }
@@ -3310,10 +2455,24 @@ const decideRelationFilterMetadata = ({
     relDirection = 'OUT';
     if (thisType === relatedType) {
       isReflexiveRelationType = true;
-      if (fieldName === 'from') {
+      const isReflexiveOutputType = isReflexiveRelationshipOutputType({
+        schemaType
+      });
+      const directedNodeFieldNames = schemaType.astNode.fields.map(
+        field => field.name.value
+      );
+      const fromFieldName = directedNodeFieldNames[0];
+      const toFieldName = directedNodeFieldNames[1];
+      if (
+        fieldName === 'from' ||
+        (isReflexiveOutputType && fieldName === fromFieldName)
+      ) {
         isReflexiveTypeDirectedField = true;
         relDirection = 'IN';
-      } else if (fieldName === 'to') {
+      } else if (
+        fieldName === 'to' ||
+        (isReflexiveOutputType && fieldName === toFieldName)
+      ) {
         isReflexiveTypeDirectedField = true;
       }
     } else if (thisType !== relatedType) {
@@ -3573,7 +2732,7 @@ const buildFilterPredicates = ({
   schema,
   isListFilterArgument
 }) => {
-  return Object.entries(filterValue)
+  const predicates = Object.entries(filterValue)
     .reduce((predicates, [name, value]) => {
       name = deserializeFilterFieldName(name);
       const predicate = translateFilterArgument({
@@ -3595,6 +2754,7 @@ const buildFilterPredicates = ({
       return predicates;
     }, [])
     .join(' AND ');
+  return predicates;
 };
 
 const decideNeo4jTypeFilter = ({ filterOperationType, typeName }) => {
@@ -3703,6 +2863,7 @@ const translateNeo4jTypeFilter = ({
     nullFieldPredicate,
     rootPredicateFunction,
     cypherTypeConstructor,
+    parentIsListArgument: isListFilterArgument,
     isTemporalFilter,
     isSpatialFilter
   });
@@ -3713,6 +2874,7 @@ const buildNeo4jTypeTranslation = ({
   listVariable,
   isTemporalFilter,
   isSpatialFilter,
+  parentIsListArgument,
   isListFilterArgument,
   filterValue,
   nullFieldPredicate,
@@ -3734,7 +2896,7 @@ const buildNeo4jTypeTranslation = ({
     !filterOperationType || filterOperationType === 'not';
   if (
     (isTemporalFilter || isSpatialFilter) &&
-    (isIdentityFilter || isListFilterArgument)
+    (isIdentityFilter || isListFilterArgument || parentIsListArgument)
   ) {
     const generalizedComparisonPredicates = Object.keys(filterValue).map(
       filterName => {
@@ -3778,6 +2940,7 @@ const buildNeo4jTypePredicate = ({
   nullFieldPredicate,
   rootPredicateFunction,
   cypherTypeConstructor,
+  parentIsListArgument,
   isTemporalFilter,
   isSpatialFilter
 }) => {
@@ -3800,6 +2963,7 @@ const buildNeo4jTypePredicate = ({
     listVariable,
     isTemporalFilter,
     isSpatialFilter,
+    parentIsListArgument,
     isListFilterArgument,
     filterValue,
     nullFieldPredicate,
